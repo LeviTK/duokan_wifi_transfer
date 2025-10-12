@@ -21,7 +21,7 @@ except ImportError:
 
 
 class ConnectionTestWorker(QThread):
-    """Background worker to test connectivity."""
+    """后台线程测试连接，避免阻塞 Calibre 主界面。"""
     finished = pyqtSignal(bool, int, str, str)  # success, status_code, content, error_message
 
     def __init__(self, address):
@@ -48,7 +48,7 @@ class ConnectionTestWorker(QThread):
 
 
 class SendBooksWorker(QThread):
-    """Background worker that sends books sequentially."""
+    """后台线程顺序发送书籍，减轻主线程压力。"""
     progress = pyqtSignal(int, int, str)  # current_index, total, title
     finished = pyqtSignal(int, list)  # success_count, failed_books
 
