@@ -20,7 +20,7 @@ class DuokanWifiBase(InterfaceActionBase):
     description         = '通过WiFi将书籍传输到多看阅读'
     supported_platforms = ['windows', 'osx', 'linux']
     author             = 'Your Name'
-    version            = (1, 1, 0)
+    version            = (1, 2, 0)
     minimum_calibre_version = (2, 0, 0)
 
     #: This field defines the GUI plugin class that contains all the code

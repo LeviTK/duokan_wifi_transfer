@@ -78,49 +78,118 @@ class InterfacePlugin(InterfaceAction):
             print(f"目标地址: {self.duokan_wifi_address}/files")
             print(f"文件路径: {epub_path}")
             
-            # 准备文件数据
-            with open(epub_path, 'rb') as f:
-                file_data = f.read()
-            
             # 生成分隔符
             boundary = str(uuid.uuid4())
             
             # 构建multipart表单数据
             content_type = mimetypes.guess_type(epub_path)[0] or 'application/epub+zip'
             filename = os.path.basename(epub_path)
-            
-            # 构建请求头
+            preamble = (
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="newfile"; filename="{filename}"\r\n'
+                f'Content-Type: {content_type}\r\n'
+                '\r\n'
+            ).encode()
+            epilogue = f'\r\n--{boundary}--\r\n'.encode()
+            file_size = os.path.getsize(epub_path)
+            content_length = len(preamble) + file_size + len(epilogue)
+
             headers = {
                 'User-Agent': 'Calibre Duokan Plugin/1.0',
-                'Content-Type': f'multipart/form-data; boundary={boundary}'
+                'Content-Type': f'multipart/form-data; boundary={boundary}',
+                'Content-Length': str(content_length)
             }
-            
-            # 构建请求体
-            body = []
-            body.append(f'--{boundary}'.encode())
-            body.append(f'Content-Disposition: form-data; name="newfile"; filename="{filename}"'.encode())
-            body.append(f'Content-Type: {content_type}'.encode())
-            body.append(b'')
-            body.append(file_data)
-            body.append(f'--{boundary}--'.encode())
-            body.append(b'')
-            
-            body = b'\r\n'.join(body)
-            
-            # 创建请求
-            request = urllib.request.Request(
-                self.duokan_wifi_address + '/files',  # 修改为正确的URL
-                data=body,
-                headers=headers,
-                method='POST'
-            )
-            
-            # 发送请求
-            response = urllib.request.urlopen(request, timeout=30)
+
+            class MultipartStream:
+                """按需读取 multipart 内容，避免一次性加载整本书。"""
+
+                def __init__(self, path, head, tail, chunk_size=64 * 1024):
+                    self.path = path
+                    self.head = head
+                    self.tail = tail
+                    self.chunk_size = chunk_size
+                    self._head_pos = 0
+                    self._tail_pos = 0
+                    self._stage = 'head'
+                    self._file = None
+
+                def read(self, size=-1):
+                    if size == 0:
+                        return b''
+
+                    chunks = bytearray()
+                    remaining = size
+
+                    while size < 0 or remaining > 0:
+                        if self._stage == 'head':
+                            data = self.head[self._head_pos:]
+                            if not data:
+                                self._stage = 'file'
+                                continue
+                            if size >= 0:
+                                data = data[:remaining]
+                            self._head_pos += len(data)
+                            chunks.extend(data)
+                        elif self._stage == 'file':
+                            if self._file is None:
+                                self._file = open(self.path, 'rb')
+                            to_read = self.chunk_size if size < 0 else min(self.chunk_size, remaining)
+                            data = self._file.read(to_read)
+                            if data:
+                                chunks.extend(data)
+                            else:
+                                self._file.close()
+                                self._file = None
+                                self._stage = 'tail'
+                                continue
+                        elif self._stage == 'tail':
+                            data = self.tail[self._tail_pos:]
+                            if not data:
+                                self._stage = 'done'
+                                break
+                            if size >= 0:
+                                data = data[:remaining]
+                            self._tail_pos += len(data)
+                            chunks.extend(data)
+                        else:
+                            break
+
+                        if size >= 0:
+                            remaining -= len(data)
+                            if remaining <= 0:
+                                break
+
+                    return bytes(chunks)
+
+                def close(self):
+                    if self._file:
+                        self._file.close()
+                        self._file = None
+
+            stream = MultipartStream(epub_path, preamble, epilogue)
+
+            try:
+                request = urllib.request.Request(
+                    self.duokan_wifi_address + '/files',  # 修改为正确的URL
+                    data=stream,
+                    headers=headers,
+                    method='POST'
+                )
+                
+                # 发送请求
+                response = urllib.request.urlopen(request, timeout=30)
+            finally:
+                stream.close()
             
             # 打印响应信息
+            raw_content = response.read()
+            encoding = response.headers.get_content_charset() or 'utf-8'
+            try:
+                response_content = raw_content.decode(encoding)
+            except UnicodeDecodeError:
+                response_content = raw_content.decode('utf-8', errors='replace')
+            
             print(f"响应状态码: {response.status}")
-            response_content = response.read().decode('utf-8')
             print(f"响应内容: {response_content}")
             
             if response.status == 200:
