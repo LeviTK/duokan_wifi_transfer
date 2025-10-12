@@ -62,12 +62,14 @@ class InterfacePlugin(InterfaceAction):
     def show_dialog(self):
         from calibre_plugins.duokan_wifi_transfer.main import DuokanWiFiDialog
         dialog = DuokanWiFiDialog(self.gui, self)
-        dialog.exec_()
+        exec_method = getattr(dialog, 'exec', dialog.exec_)
+        exec_method()
     
     def send_book_to_duokan(self, epub_path, title):
         """发送书籍到多看阅读"""
         try:
             import urllib.request
+            import urllib.error
             import mimetypes
             import uuid
             
@@ -122,18 +124,21 @@ class InterfacePlugin(InterfaceAction):
             print(f"响应内容: {response_content}")
             
             if response.status == 200:
-                return True
+                return True, None
             else:
                 error_msg = f'HTTP状态码: {response.status}'
-                error_dialog(self.gui, '发送失败', 
-                            f'无法发送书籍 {title}\n{error_msg}', 
-                            show=True)
-                return False
+                return False, error_msg
                 
+        except urllib.error.URLError as e:
+            reason = getattr(e, 'reason', e)
+            if isinstance(reason, ConnectionRefusedError):
+                error_msg = '无法连接到多看阅读WiFi服务（连接被拒绝）'
+            else:
+                error_msg = f'无法连接到多看阅读WiFi服务：{reason}'
+            print(f"发送书籍 {title} 发生网络错误: {error_msg}")
+            return False, error_msg
         except Exception as e:
             import traceback
-            error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
-            error_dialog(self.gui, '发送失败', 
-                        f'发送书籍 {title} 时出错:\n{error_msg}', 
-                        show=True)
-            return False
+            error_msg = f'发送书籍 {title} 时出现未预期错误：{type(e).__name__}: {str(e)}'
+            print(f"{error_msg}\n{traceback.format_exc()}")
+            return False, error_msg

@@ -12,10 +12,81 @@ from calibre.gui2 import error_dialog, info_dialog
 
 try:
     from qt.core import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                        QLabel, QProgressBar, QLineEdit, QMessageBox)
+                        QLabel, QProgressBar, QLineEdit, QMessageBox,
+                        QThread, pyqtSignal)
 except ImportError:
     from PyQt5.Qt import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                         QLabel, QProgressBar, QLineEdit, QMessageBox)
+                         QLabel, QProgressBar, QLineEdit, QMessageBox,
+                         QThread, pyqtSignal)
+
+
+class ConnectionTestWorker(QThread):
+    """Background worker to test connectivity."""
+    finished = pyqtSignal(bool, int, str, str)  # success, status_code, content, error_message
+
+    def __init__(self, address):
+        super(ConnectionTestWorker, self).__init__()
+        self.address = address
+
+    def run(self):
+        import urllib.request
+        import traceback
+
+        try:
+            request = urllib.request.Request(
+                self.address,
+                headers={'User-Agent': 'Calibre Duokan Plugin/1.0'}
+            )
+            response = urllib.request.urlopen(request, timeout=5)
+            content = response.read().decode('utf-8', errors='replace')
+            print(f"测试连接响应状态码: {response.status}")
+            print(f"测试连接响应内容: {content}")
+            self.finished.emit(response.status == 200, response.status, content, '')
+        except Exception as e:
+            error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
+            self.finished.emit(False, 0, '', error_msg)
+
+
+class SendBooksWorker(QThread):
+    """Background worker that sends books sequentially."""
+    progress = pyqtSignal(int, int, str)  # current_index, total, title
+    finished = pyqtSignal(int, list)  # success_count, failed_books
+
+    def __init__(self, plugin_action, books):
+        super(SendBooksWorker, self).__init__()
+        self.plugin_action = plugin_action
+        self.books = books
+
+    def run(self):
+        success_count = 0
+        failed_books = []
+        total = len(self.books)
+
+        for index, book in enumerate(self.books, start=1):
+            title = book['title']
+            epub_path = book['path']
+
+            self.progress.emit(index, total, title)
+
+            try:
+                result = self.plugin_action.send_book_to_duokan(epub_path, title)
+                if isinstance(result, tuple):
+                    success, error_message = result
+                else:
+                    success = bool(result)
+                    error_message = None if success else '发送失败'
+            except Exception as e:
+                import traceback
+                error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
+                failed_books.append((title, error_msg))
+                continue
+
+            if success:
+                success_count += 1
+            else:
+                failed_books.append((title, error_message or '发送失败'))
+
+        self.finished.emit(success_count, failed_books)
 
 class DuokanWiFiDialog(QDialog):
     def __init__(self, gui, plugin_action):
@@ -38,9 +109,9 @@ class DuokanWiFiDialog(QDialog):
         wifi_group.addWidget(QLabel('多看阅读WiFi地址:'))
         self.wifi_address = QLineEdit(self.plugin_action.duokan_wifi_address)
         wifi_group.addWidget(self.wifi_address)
-        test_button = QPushButton('测试连接')
-        test_button.clicked.connect(self.test_connection)
-        wifi_group.addWidget(test_button)
+        self.test_button = QPushButton('测试连接')
+        self.test_button.clicked.connect(self.test_connection)
+        wifi_group.addWidget(self.test_button)
         layout.addLayout(wifi_group)
         
         # 选中书籍信息
@@ -74,6 +145,9 @@ class DuokanWiFiDialog(QDialog):
         
         # 更新书籍信息
         self.update_book_info()
+        self.connection_thread = None
+        self.send_thread = None
+        self.initial_failed_books = []
     
     def update_book_info(self):
         """更新选中书籍的信息"""
@@ -88,48 +162,90 @@ class DuokanWiFiDialog(QDialog):
     
     def test_connection(self):
         """测试与多看阅读WiFi服务的连接"""
-        address = self.wifi_address.text().strip()
-        if not address:
+        raw_address = self.wifi_address.text().strip()
+        if not raw_address:
             return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
         
+        address = raw_address
         if not address.startswith('http://'):
             address = 'http://' + address
+            self.wifi_address.setText(address)
         
-        try:
-            import urllib.request
-            
-            # 创建请求
-            request = urllib.request.Request(
-                address,
-                headers={'User-Agent': 'Calibre Duokan Plugin/1.0'}
-            )
-            
-            # 发送请求
-            response = urllib.request.urlopen(request, timeout=5)
-            
-            # 打印响应信息
-            print(f"测试连接响应状态码: {response.status}")
-            content = response.read().decode('utf-8')
-            print(f"测试连接响应内容: {content}")
-            
-            if response.status == 200:
-                QMessageBox.information(self, '成功', '成功连接到多看阅读WiFi服务')
+        if self.connection_thread and self.connection_thread.isRunning():
+            return
+
+        self.test_button.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setMaximum(0)
+        self.progress.setFormat('正在测试连接...')
+
+        self.connection_thread = ConnectionTestWorker(address)
+        self.connection_thread.finished.connect(self.on_connection_test_finished)
+        self.connection_thread.start()
+
+    def on_connection_test_finished(self, success, status_code, content, error_message):
+        """Handle completion of connection test."""
+        self.progress.setVisible(False)
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.progress.setFormat('')
+
+        self.test_button.setEnabled(True)
+        self.connection_thread = None
+
+        if success:
+            QMessageBox.information(self, '成功', '成功连接到多看阅读WiFi服务')
+        else:
+            if error_message:
+                QMessageBox.critical(self, '错误', f'连接失败：\n{error_message}')
             else:
-                QMessageBox.warning(self, '连接失败', 
-                                  f'无法连接到多看阅读WiFi服务。\n状态码: {response.status}\n响应: {content}')
-        except Exception as e:
-            import traceback
-            error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
-            QMessageBox.critical(self, '错误', f'连接失败：\n{error_msg}')
-    
+                QMessageBox.warning(
+                    self, '连接失败',
+                    f'无法连接到多看阅读WiFi服务。\n状态码: {status_code}\n响应: {content}'
+                )
+
+    def on_send_progress(self, current, total, title):
+        """Update progress bar from background thread."""
+        self.progress.setMaximum(total)
+        self.progress.setValue(current)
+        self.progress.setFormat(f'正在处理: {title}')
+
+    def on_send_finished(self, success_count, worker_failed_books):
+        """Handle completion of book sending."""
+        self.progress.setVisible(False)
+        self.progress.setValue(0)
+        self.progress.setFormat('')
+
+        self.send_button.setEnabled(True)
+        self.test_button.setEnabled(True)
+
+        self.send_thread = None
+
+        failed_books = list(self.initial_failed_books)
+        failed_books.extend(worker_failed_books)
+        self.initial_failed_books = []
+
+        result_message = f'成功发送 {success_count} 本书籍到多看阅读\n'
+        if failed_books:
+            result_message += '\n发送失败的书籍：\n'
+            for book, reason in failed_books:
+                result_message += f'- {book}: {reason}\n'
+
+        if success_count > 0:
+            QMessageBox.information(self, '完成', result_message)
+        else:
+            QMessageBox.warning(self, '失败', result_message)
+
     def save_settings(self):
         """保存WiFi地址设置"""
-        address = self.wifi_address.text().strip()
-        if not address:
+        raw_address = self.wifi_address.text().strip()
+        if not raw_address:
             return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
         
+        address = raw_address
         if not address.startswith('http://'):
             address = 'http://' + address
+            self.wifi_address.setText(address)
         
         self.plugin_action.duokan_wifi_address = address
         self.plugin_action.prefs['wifi_address'] = address
@@ -137,63 +253,75 @@ class DuokanWiFiDialog(QDialog):
     
     def send_books(self):
         """发送选中的书籍到多看阅读"""
+        if self.send_thread and self.send_thread.isRunning():
+            return QMessageBox.information(self, '提示', '正在发送书籍，请稍候')
+
+        # 确保目标地址有效
+        raw_address = self.wifi_address.text().strip()
+        if not raw_address:
+            return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
+
+        current_address = raw_address
+        if not current_address.startswith('http://'):
+            current_address = 'http://' + current_address
+            self.wifi_address.setText(current_address)
+
+        self.plugin_action.duokan_wifi_address = current_address
+
         # 获取选中的书籍
         rows = self.gui.library_view.selectionModel().selectedRows()
         if not rows:
             return error_dialog(self, '错误', '请先选择要发送的书籍', show=True)
         
-        # 准备进度条
-        total = len(rows)
-        self.progress.setMaximum(total)
-        self.progress.setValue(0)
-        self.progress.setVisible(True)
-        
         # 获取书籍IDs
         ids = list(map(self.gui.library_view.model().id, rows))
         db = self.gui.current_db.new_api
-        
-        # 处理每本书
-        success_count = 0
-        failed_books = []
-        
-        for i, book_id in enumerate(ids):
+
+        books_to_send = []
+        self.initial_failed_books = []
+
+        for book_id in ids:
+            metadata = None
+            title = f'ID {book_id}'
             try:
                 metadata = db.get_metadata(book_id)
-                title = metadata.title
-                
-                # 更新进度条
-                self.progress.setValue(i)
-                self.progress.setFormat(f'正在处理: {title}')
-                
-                # 获取EPUB格式
-                epub_path = db.format_abspath(book_id, 'EPUB')
-                if not epub_path:
-                    failed_books.append((title, "没有EPUB格式"))
-                    continue
-                
-                # 发送书籍
-                if self.plugin_action.send_book_to_duokan(epub_path, title):
-                    success_count += 1
-                else:
-                    failed_books.append((title, "发送失败"))
-                    
+                if metadata:
+                    title = metadata.title or title
             except Exception as e:
                 import traceback
                 error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}'
-                failed_books.append((title, error_msg))
-                print(f"发送书籍 {title} 时出错:\n{traceback.format_exc()}")
-        
-        # 完成处理
-        self.progress.setVisible(False)
-        
-        # 显示结果
-        result_message = f'成功发送 {success_count} 本书籍到多看阅读\n'
-        if failed_books:
-            result_message += '\n发送失败的书籍：\n'
-            for book, reason in failed_books:
-                result_message += f'• {book}: {reason}\n'
-        
-        if success_count > 0:
-            QMessageBox.information(self, '完成', result_message)
-        else:
+                self.initial_failed_books.append((title, error_msg))
+                print(f"准备书籍 {title} 时出错:\n{traceback.format_exc()}")
+                continue
+
+            epub_path = db.format_abspath(book_id, 'EPUB')
+            if not epub_path:
+                self.initial_failed_books.append((title, "没有EPUB格式"))
+                continue
+
+            books_to_send.append({'title': title, 'path': epub_path})
+
+        if not books_to_send:
+            result_message = '没有可发送的书籍。\n'
+            if self.initial_failed_books:
+                result_message += '\n发送失败的书籍：\n'
+                for book, reason in self.initial_failed_books:
+                    result_message += f'- {book}: {reason}\n'
             QMessageBox.warning(self, '失败', result_message)
+            return
+
+        # 准备进度条和按钮
+        total = len(books_to_send)
+        self.progress.setMaximum(total)
+        self.progress.setValue(0)
+        self.progress.setFormat('准备发送...')
+        self.progress.setVisible(True)
+
+        self.send_button.setEnabled(False)
+        self.test_button.setEnabled(False)
+
+        # 启动后台线程
+        self.send_thread = SendBooksWorker(self.plugin_action, books_to_send)
+        self.send_thread.progress.connect(self.on_send_progress)
+        self.send_thread.finished.connect(self.on_send_finished)
+        self.send_thread.start()
