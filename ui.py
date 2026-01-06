@@ -13,12 +13,37 @@ from calibre.gui2 import error_dialog, info_dialog
 
 try:
     from qt.core import QMenu, QInputDialog, QLineEdit
+    from qt.gui import QIcon
 except ImportError:
-    from PyQt5.Qt import QMenu, QInputDialog, QLineEdit
+    from PyQt5.Qt import QMenu, QInputDialog, QLineEdit, QIcon
 
 class InterfacePlugin(InterfaceAction):
     name = '多看阅读WiFi传书'
-    action_spec = ('多看阅读WiFi传书', None, '一键传书到多看阅读', 'Ctrl+Shift+D')
+    action_spec = ('多看阅读WiFi传书', 'images/icon.png', '一键传书到多看阅读', 'Ctrl+Shift+D')
+    
+    def get_icons(self):
+        """
+        Return all icons for this plugin.
+        Calibre will call this method to get icons.
+        """
+        import os
+        icons = {}
+        base = os.path.dirname(os.path.abspath(__file__))
+        
+        # 定义所有可能的图标名称映射到同一个图标文件
+        icon_path = os.path.join(base, 'images', 'icon.png')
+        
+        # 检查图标文件是否存在
+        if os.path.exists(icon_path):
+            with open(icon_path, 'rb') as f:
+                icon_data = f.read()
+                # 注册多个可能的名称，确保Calibre能找到图标
+                icons['images/icon.png'] = icon_data
+                icons['icon'] = icon_data
+                icons['icon.png'] = icon_data
+                icons['default'] = icon_data
+        
+        return icons
     
     def genesis(self):
         self.qaction.triggered.connect(self.show_dialog)
@@ -28,7 +53,16 @@ class InterfacePlugin(InterfaceAction):
         self.qaction.setMenu(self.menu)
         
         # 添加菜单项
-        self.send_action = self.menu.addAction('发送选中的书籍', self.show_dialog)
+        try:
+            # 尝试获取图标并添加到菜单项
+            icon = self.get_icon('images/icon.png')
+            if icon:
+                self.send_action = self.menu.addAction(icon, '发送选中的书籍', self.show_dialog)
+            else:
+                self.send_action = self.menu.addAction('发送选中的书籍', self.show_dialog)
+        except:
+            # 如果获取图标失败，添加无图标的菜单项
+            self.send_action = self.menu.addAction('发送选中的书籍', self.show_dialog)
         self.config_action = self.menu.addAction('配置WiFi地址', self.configure)
         
         # 从设置加载WiFi地址
