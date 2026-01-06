@@ -1,1 +1,15 @@
+# macOS
 .DS_Store
+
+# IDE - VS Code
+.vscode/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Calibre Plugin packaging artifacts
+*.zip
+*.json
+!plugin-import-name-duokan_wifi_transfer.txt
