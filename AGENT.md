@@ -12,6 +12,7 @@ src/
 ├── ui.py           # InterfacePlugin：Calibre 工具栏动作、菜单、HTTP 上传
 ├── main.py         # DuokanWiFiDialog、ConnectionTestWorker、SendBooksWorker
 └── images/         # 图标资源（icon.png 为工具栏图标）
+dist/               # 打包产物（已加入 .gitignore，不纳入版本控制）
 doc/                # 文档目录
 README.md
 AGENT.md
@@ -34,12 +35,18 @@ AGENT.md
 
 ## 打包插件
 
-Calibre 插件以 ZIP 格式安装，打包时取 `src/` 目录内容：
+Calibre 插件以 ZIP 格式安装，打包产物输出到 `dist/`，文件名格式为 `{插件名}_{版本}.zip`。
 
 ```bash
 cd src
-zip -r ../duokan_wifi_transfer.zip .
+zip -r ../dist/duokan_wifi_transfer_v1.2.0.zip .
 ```
+
+**注意事项：**
+- 版本号取自 `src/__init__.py` 中 `DuokanWifiBase.version` 字段（元组形式，如 `(1, 2, 0)` → `v1.2.0`）
+- 每次发布新版本，需同步更新 `__init__.py` 中的 `version` 并重新打包
+- `dist/` 目录已加入 `.gitignore`，打包产物不纳入版本控制
+- 打包内容为 `src/` 目录下所有文件（含 `plugin-import-name-*.txt` 和 `images/`），不包含 `dist/`、`doc/` 等项目级目录
 
 ## 关键接口
 
