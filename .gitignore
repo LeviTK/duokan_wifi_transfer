@@ -13,3 +13,4 @@ __pycache__/
 *.zip
 *.json
 !plugin-import-name-duokan_wifi_transfer.txt
+dist/
