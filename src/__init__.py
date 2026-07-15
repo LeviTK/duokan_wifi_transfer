@@ -4,7 +4,7 @@
 from __future__ import (unicode_literals, division, absolute_import, print_function)
 
 __license__ = 'GPL v3'
-__copyright__ = '2024, Your Name'
+__copyright__ = '2024, LeviTK'
 __docformat__ = 'restructuredtext en'
 
 from calibre.customize import InterfaceActionBase
@@ -19,8 +19,8 @@ class DuokanWifiBase(InterfaceActionBase):
     name                = '多看阅读WiFi传书'
     description         = '通过WiFi将书籍传输到多看阅读'
     supported_platforms = ['windows', 'osx', 'linux']
-    author             = 'Your Name'
-    version            = (1, 2, 0)
+    author             = 'LeviTK'
+    version            = (1, 2, 1)
     minimum_calibre_version = (2, 0, 0)
 
     #: This field defines the GUI plugin class that contains all the code

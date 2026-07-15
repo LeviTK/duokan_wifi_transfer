@@ -31,16 +31,54 @@
 │   ├── images/                 # 图标资源
 │   └── plugin-import-name-duokan_wifi_transfer.txt
 ├── doc/                        # 文档目录
+├── scripts/                    # 打包、验证、安装和用户测试入口
+├── tests/                      # 在 Calibre 运行时执行的集成测试
+├── Makefile                    # 自动化命令入口
 └── README.md
 ```
 
-## 打包插件
+## 本地自动化
+
+Calibre 的 macOS 命令行目录为：
 
 ```bash
-cd src
-zip -r ../duokan_wifi_transfer.zip .
+/Applications/calibre.app/Contents/MacOS
 ```
+
+若终端尚未识别相关命令，可临时执行：
+
+```bash
+export PATH="/Applications/calibre.app/Contents/MacOS:$PATH"
+```
+
+生成版本化插件包：
+
+```bash
+make build
+```
+
+执行完整自动验证：
+
+```bash
+make verify
+```
+
+该命令会检查源码和 ZIP，并通过临时 `CALIBRE_CONFIG_DIRECTORY` 完成隔离构建、发布包安装、插件导入和本地模拟上传，不会修改日常 Calibre 配置。
+
+先正常退出 Calibre，再执行真实安装：
+
+```bash
+make install
+```
+
+安装前会把现有插件备份到 `dist/backups/`。安装完成后执行以下命令进入手机端人工验收：
+
+```bash
+make user-test
+```
+
+详细步骤和通过标准见 [用户验收手册](doc/USER_TESTING.md)。
 
 ## 版本
 
-当前版本：1.2.0
+当前版本：1.2.1

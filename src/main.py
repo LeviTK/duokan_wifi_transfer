@@ -4,7 +4,7 @@
 from __future__ import (unicode_literals, division, absolute_import, print_function)
 
 __license__ = 'GPL v3'
-__copyright__ = '2024, Your Name'
+__copyright__ = '2024, LeviTK'
 __docformat__ = 'restructuredtext en'
 
 import os
@@ -22,11 +22,12 @@ except ImportError:
 
 class ConnectionTestWorker(QThread):
     """后台线程测试连接，避免阻塞 Calibre 主界面。"""
-    finished = pyqtSignal(bool, int, str, str)  # success, status_code, content, error_message
+    result_ready = pyqtSignal(bool, int, str, str)  # success, status_code, content, error_message
 
     def __init__(self, address):
         super(ConnectionTestWorker, self).__init__()
         self.address = address
+        self.setObjectName('DuokanConnectionTest')
 
     def run(self):
         import urllib.request
@@ -41,21 +42,22 @@ class ConnectionTestWorker(QThread):
             content = response.read().decode('utf-8', errors='replace')
             print(f"测试连接响应状态码: {response.status}")
             print(f"测试连接响应内容: {content}")
-            self.finished.emit(response.status == 200, response.status, content, '')
+            self.result_ready.emit(response.status == 200, response.status, content, '')
         except Exception as e:
             error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
-            self.finished.emit(False, 0, '', error_msg)
+            self.result_ready.emit(False, 0, '', error_msg)
 
 
 class SendBooksWorker(QThread):
     """后台线程顺序发送书籍，减轻主线程压力。"""
     progress = pyqtSignal(int, int, str)  # current_index, total, title
-    finished = pyqtSignal(int, list)  # success_count, failed_books
+    completed = pyqtSignal(int, list)  # success_count, failed_books
 
     def __init__(self, plugin_action, books):
         super(SendBooksWorker, self).__init__()
         self.plugin_action = plugin_action
         self.books = books
+        self.setObjectName('DuokanSendBooks')
 
     def run(self):
         success_count = 0
@@ -86,7 +88,7 @@ class SendBooksWorker(QThread):
             else:
                 failed_books.append((title, error_message or '发送失败'))
 
-        self.finished.emit(success_count, failed_books)
+        self.completed.emit(success_count, failed_books)
 
 class DuokanWiFiDialog(QDialog):
     def __init__(self, gui, plugin_action):
@@ -137,9 +139,9 @@ class DuokanWiFiDialog(QDialog):
         button_box.addWidget(save_button)
         
         # 关闭按钮
-        close_button = QPushButton('关闭')
-        close_button.clicked.connect(self.close)
-        button_box.addWidget(close_button)
+        self.close_button = QPushButton('关闭')
+        self.close_button.clicked.connect(self.close)
+        button_box.addWidget(self.close_button)
         
         layout.addLayout(button_box)
         
@@ -148,6 +150,31 @@ class DuokanWiFiDialog(QDialog):
         self.connection_thread = None
         self.send_thread = None
         self.initial_failed_books = []
+
+    def workers_running(self):
+        """Return whether a network worker is still active."""
+        return any(
+            thread is not None and thread.isRunning()
+            for thread in (self.connection_thread, self.send_thread)
+        )
+
+    def show_busy_message(self):
+        QMessageBox.information(self, '任务进行中', '后台任务尚未完成，请稍候再关闭窗口。')
+
+    def reject(self):
+        """Prevent Escape from destroying active QThread objects."""
+        if self.workers_running():
+            self.show_busy_message()
+            return
+        super(DuokanWiFiDialog, self).reject()
+
+    def closeEvent(self, event):
+        """Prevent window close while a network worker is active."""
+        if self.workers_running():
+            event.ignore()
+            self.show_busy_message()
+            return
+        super(DuokanWiFiDialog, self).closeEvent(event)
     
     def update_book_info(self):
         """更新选中书籍的信息"""
@@ -175,12 +202,15 @@ class DuokanWiFiDialog(QDialog):
             return
 
         self.test_button.setEnabled(False)
+        self.send_button.setEnabled(False)
+        self.close_button.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setMaximum(0)
         self.progress.setFormat('正在测试连接...')
 
         self.connection_thread = ConnectionTestWorker(address)
-        self.connection_thread.finished.connect(self.on_connection_test_finished)
+        self.connection_thread.result_ready.connect(self.on_connection_test_finished)
+        self.connection_thread.finished.connect(self.on_connection_thread_finished)
         self.connection_thread.start()
 
     def on_connection_test_finished(self, success, status_code, content, error_message):
@@ -189,9 +219,6 @@ class DuokanWiFiDialog(QDialog):
         self.progress.setMaximum(1)
         self.progress.setValue(0)
         self.progress.setFormat('')
-
-        self.test_button.setEnabled(True)
-        self.connection_thread = None
 
         if success:
             QMessageBox.information(self, '成功', '成功连接到多看阅读WiFi服务')
@@ -204,6 +231,16 @@ class DuokanWiFiDialog(QDialog):
                     f'无法连接到多看阅读WiFi服务。\n状态码: {status_code}\n响应: {content}'
                 )
 
+    def on_connection_thread_finished(self):
+        """Release the worker only after QThread has actually stopped."""
+        thread = self.connection_thread
+        self.connection_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        self.test_button.setEnabled(True)
+        self.close_button.setEnabled(True)
+        self.update_book_info()
+
     def on_send_progress(self, current, total, title):
         """Update progress bar from background thread."""
         self.progress.setMaximum(total)
@@ -215,11 +252,6 @@ class DuokanWiFiDialog(QDialog):
         self.progress.setVisible(False)
         self.progress.setValue(0)
         self.progress.setFormat('')
-
-        self.send_button.setEnabled(True)
-        self.test_button.setEnabled(True)
-
-        self.send_thread = None
 
         failed_books = list(self.initial_failed_books)
         failed_books.extend(worker_failed_books)
@@ -235,6 +267,16 @@ class DuokanWiFiDialog(QDialog):
             QMessageBox.information(self, '完成', result_message)
         else:
             QMessageBox.warning(self, '失败', result_message)
+
+    def on_send_thread_finished(self):
+        """Release the worker only after QThread has actually stopped."""
+        thread = self.send_thread
+        self.send_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        self.test_button.setEnabled(True)
+        self.close_button.setEnabled(True)
+        self.update_book_info()
 
     def save_settings(self):
         """保存WiFi地址设置"""
@@ -319,9 +361,11 @@ class DuokanWiFiDialog(QDialog):
 
         self.send_button.setEnabled(False)
         self.test_button.setEnabled(False)
+        self.close_button.setEnabled(False)
 
         # 启动后台线程
         self.send_thread = SendBooksWorker(self.plugin_action, books_to_send)
         self.send_thread.progress.connect(self.on_send_progress)
-        self.send_thread.finished.connect(self.on_send_finished)
+        self.send_thread.completed.connect(self.on_send_finished)
+        self.send_thread.finished.connect(self.on_send_thread_finished)
         self.send_thread.start()

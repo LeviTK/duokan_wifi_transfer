@@ -4,6 +4,17 @@
 
 ---
 
+## [1.2.1] - 2026-07-15
+
+### Added
+- 新增 `Makefile` 和 `scripts/automation.py`，支持版本化打包、静态校验、隔离 Calibre 安装测试与真实安装备份
+- 新增 Calibre 运行时模拟上传测试，验证 `/files` multipart 请求、字段名、文件名和 EPUB 内容
+- 新增调试模式用户测试入口及 `doc/USER_TESTING.md` 验收手册
+
+### Fixed
+- 修复后台线程结果信号覆盖 `QThread.finished`，导致线程尚未退出便被销毁并使 Calibre 崩溃的问题
+- 后台连接或发送任务执行期间阻止关闭对话框，避免活动线程随窗口销毁
+
 ## [1.2.0] - 2025-11-08
 
 ### Changed
