@@ -19,13 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 DIST_DIR = ROOT / "dist"
 TEST_SCRIPT = ROOT / "tests" / "calibre_integration.py"
-PLUGIN_NAME = "多看阅读WiFi传书"
+PLUGIN_NAME = "WiFi传书"
+LEGACY_PLUGIN_NAMES = ("多看阅读WiFi传书",)
 PLUGIN_IMPORT_NAME = "duokan_wifi_transfer"
 ARCHIVE_PREFIX = "duokan_wifi_transfer_v"
 CALIBRE_APP_BIN = Path("/Applications/calibre.app/Contents/MacOS")
 REQUIRED_FILES = {
     "__init__.py",
     "main.py",
+    "transport.py",
     "ui.py",
     "plugin-import-name-duokan_wifi_transfer.txt",
     "images/icon.png",
@@ -186,9 +188,11 @@ def calibre_verify(output: Path) -> None:
             "assert p is not None; "
             f"from calibre_plugins.{PLUGIN_IMPORT_NAME}.ui import InterfacePlugin; "
             f"from calibre_plugins.{PLUGIN_IMPORT_NAME}.main import "
-            "DuokanWiFiDialog, ConnectionTestWorker, SendBooksWorker; "
+            "DeviceManagerDialog, DuokanWiFiDialog, ResolutionWorker, SendBooksWorker; "
+            f"from calibre_plugins.{PLUGIN_IMPORT_NAME}.transport import probe_receiver; "
             "print('IMPORT OK:', p.name, p.version, InterfacePlugin.name, "
-            "DuokanWiFiDialog.__name__, ConnectionTestWorker.__name__, SendBooksWorker.__name__)"
+            "DeviceManagerDialog.__name__, DuokanWiFiDialog.__name__, "
+            "ResolutionWorker.__name__, SendBooksWorker.__name__)"
         )
         run([debug, "-c", import_check], env=env)
         run([debug, "-e", str(TEST_SCRIPT)], env=env)
@@ -214,15 +218,15 @@ def calibre_config_dir(debug: str) -> Path:
     return Path(lines[-1]).expanduser()
 
 
-def backup_installed_plugin(config_dir: Path) -> Path | None:
-    installed = config_dir / "plugins" / f"{PLUGIN_NAME}.zip"
+def backup_installed_plugin(config_dir: Path, plugin_name: str) -> Path | None:
+    installed = config_dir / "plugins" / f"{plugin_name}.zip"
     if not installed.exists():
-        print("BACKUP: 未发现已安装版本，跳过")
+        print(f"BACKUP: 未发现 {plugin_name}，跳过")
         return None
     backup_dir = DIST_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup = backup_dir / f"{PLUGIN_NAME}_{timestamp}.zip"
+    backup = backup_dir / f"{plugin_name}_{timestamp}.zip"
     shutil.copy2(installed, backup)
     print(f"BACKUP OK: {backup}")
     return backup
@@ -249,7 +253,7 @@ def install(*, shutdown: bool) -> None:
     if not shutdown and calibre_is_running():
         fail("Calibre 正在运行；请正常退出后重试，或明确执行 make install-shutdown")
 
-    verify()
+    output = verify()
     if shutdown:
         print("正在请求 Calibre 安全关闭；请确认没有正在执行的重要任务。")
         subprocess.run([debug, "-s"], cwd=ROOT, check=False)
@@ -257,8 +261,14 @@ def install(*, shutdown: bool) -> None:
         print("Calibre 未运行，继续安装。")
 
     config_dir = calibre_config_dir(debug)
-    backup_installed_plugin(config_dir)
-    run([customize, "-b", str(SRC_DIR)])
+    for plugin_name in (PLUGIN_NAME, *LEGACY_PLUGIN_NAMES):
+        backup_installed_plugin(config_dir, plugin_name)
+    for legacy_name in LEGACY_PLUGIN_NAMES:
+        legacy_zip = config_dir / "plugins" / f"{legacy_name}.zip"
+        if legacy_zip.exists():
+            run([customize, "-r", legacy_name])
+            print(f"MIGRATION: 已移除旧名称插件 {legacy_name}")
+    run([customize, "-a", str(output)])
     listed = run([customize, "-l"], capture=True).stdout
     assert_plugin_listed(listed)
     print(f"INSTALL OK: {PLUGIN_NAME} {plugin_version()}")

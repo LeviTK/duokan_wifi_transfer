@@ -1,247 +1,283 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function, unicode_literals
 
-from __future__ import (unicode_literals, division, absolute_import, print_function)
+import uuid
 
-__license__ = 'GPL v3'
-__copyright__ = '2024, LeviTK'
-__docformat__ = 'restructuredtext en'
-
-import os
-from calibre.gui2.actions import InterfaceAction
 from calibre.gui2 import error_dialog, info_dialog
-
+from calibre.gui2.actions import InterfaceAction
+from calibre.utils.config import JSONConfig
 try:
-    from qt.core import QMenu, QInputDialog, QLineEdit
-    from qt.gui import QIcon
+    from qt.core import QDialog, QInputDialog, QMenu, QMessageBox, QProgressDialog, Qt
 except ImportError:
-    from PyQt5.Qt import QMenu, QInputDialog, QLineEdit, QIcon
+    from PyQt5.Qt import QDialog, QInputDialog, QMenu, QMessageBox, QProgressDialog, Qt
+
+from calibre_plugins.duokan_wifi_transfer.transport import saved_endpoint, upload_epub
+
+
+def normalize_devices(raw_devices, active_id=None, selected_ids=None, id_factory=None):
+    """Validate identities and normalize active and recipient selections."""
+    id_factory = id_factory or (lambda: uuid.uuid4().hex)
+    devices = []
+    used = set()
+    for raw in raw_devices if isinstance(raw_devices, (list, tuple)) else []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            host, port = saved_endpoint(raw.get('host', ''), raw.get('port', 8080))
+        except (TypeError, ValueError):
+            continue
+        identifier = raw.get('id')
+        if not isinstance(identifier, str) or not identifier or identifier in used:
+            identifier = id_factory()
+            while identifier in used:
+                identifier = id_factory()
+        used.add(identifier)
+        devices.append({'id': identifier, 'name': str(raw.get('name') or host).strip() or host,
+                        'host': host, 'port': port})
+    active = active_id if active_id in used else (devices[0]['id'] if devices else None)
+    requested = selected_ids if isinstance(selected_ids, (list, tuple)) else []
+    selected = [item['id'] for item in devices if item['id'] in requested]
+    if not selected and active:
+        selected = [active]
+    return devices, active, selected
+
 
 class InterfacePlugin(InterfaceAction):
-    name = '多看阅读WiFi传书'
-    action_spec = ('多看阅读WiFi传书', 'images/icon.png', '一键传书到多看阅读', 'Ctrl+Shift+D')
-    
-    def get_icons(self):
-        """
-        Return all icons for this plugin.
-        Calibre will call this method to get icons.
-        """
-        import os
-        icons = {}
-        base = os.path.dirname(os.path.abspath(__file__))
-        
-        # 定义所有可能的图标名称映射到同一个图标文件
-        icon_path = os.path.join(base, 'images', 'icon.png')
-        
-        # 检查图标文件是否存在
-        if os.path.exists(icon_path):
-            with open(icon_path, 'rb') as f:
-                icon_data = f.read()
-                # 注册多个可能的名称，确保Calibre能找到图标
-                icons['images/icon.png'] = icon_data
-                icons['icon'] = icon_data
-                icons['icon.png'] = icon_data
-                icons['default'] = icon_data
-        
-        return icons
-    
+    name = 'WiFi传书'
+    action_spec = (name, None, '发送到选中的多看设备', 'Ctrl+Shift+D')
+
     def genesis(self):
-        self.qaction.triggered.connect(self.show_dialog)
-        
-        # 创建菜单
+        self.prefs = JSONConfig('plugins/duokan_wifi_transfer')
+        self._migrate()
+        devices, active, selected = normalize_devices(
+            self.prefs.get('devices', []), self.prefs.get('active_device_id'),
+            self.prefs.get('selected_device_ids', []))
+        self._save_devices(devices, active, selected)
+        # get_icons is injected by Calibre's plugin loader for ZIP resources.
+        icon = get_icons('images/icon.png', self.name)
+        self.qaction.setIcon(icon)
+        clone = getattr(self, 'menuless_qaction', None)
+        if clone is not None:
+            clone.setIcon(icon)
+        self.qaction.triggered.connect(self.send_selected)
         self.menu = QMenu(self.gui)
         self.qaction.setMenu(self.menu)
-        
-        # 添加菜单项
+        self.resolution_worker = None
+        self.resolution_progress = None
+        self.current_manager = None
+        self.current_send_dialog = None
+        self._resolution_result = None
+        self._resolution_origin_manager = None
+        self._shutting_down = False
+        self.rebuild_menu()
+
+    def _migrate(self):
+        if self.prefs.get('devices'):
+            return
+        legacy = self.prefs.get('wifi_address')
+        if not isinstance(legacy, str) or not legacy.strip():
+            return
+        if legacy.strip().rstrip('/') == 'http://192.168.1.100:8080':
+            del self.prefs['wifi_address']
+            return
         try:
-            # 尝试获取图标并添加到菜单项
-            icon = self.get_icon('images/icon.png')
-            if icon:
-                self.send_action = self.menu.addAction(icon, '发送选中的书籍', self.show_dialog)
+            host, port = saved_endpoint(legacy)
+        except ValueError:
+            return
+        device = {'id': uuid.uuid4().hex, 'name': '原有设备', 'host': host, 'port': port}
+        self.prefs['devices'] = [device]
+        self.prefs['active_device_id'] = device['id']
+        self.prefs['selected_device_ids'] = [device['id']]
+        del self.prefs['wifi_address']
+
+    def _save_devices(self, devices, active, selected):
+        self.prefs['devices'] = devices
+        self.prefs['active_device_id'] = active
+        self.prefs['selected_device_ids'] = selected
+
+    def devices(self):
+        return list(self.prefs.get('devices', []))
+
+    def selected_devices(self):
+        selected = set(self.prefs.get('selected_device_ids', []))
+        result = [item for item in self.devices() if item['id'] in selected]
+        if result:
+            return result
+        active = self.prefs.get('active_device_id')
+        return [item for item in self.devices() if item['id'] == active]
+
+    def rebuild_menu(self):
+        self.menu.clear()
+        self.menu.addAction('发送到勾选的接收设备', self.send_selected)
+        self.menu.addSeparator()
+        selected = set(self.prefs.get('selected_device_ids', []))
+        active = self.prefs.get('active_device_id')
+        for device in self.devices():
+            text = '%s%s（%s:%s）' % ('[默认] ' if device['id'] == active else '',
+                                     device['name'], device['host'], device['port'])
+            action = self.menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(device['id'] in selected)
+            action.toggled.connect(
+                lambda checked, did=device['id']: self.toggle_recipient(did, checked))
+        self.menu.addSeparator()
+        self.menu.addAction('自动查找…', self.lookup)
+        self.menu.addAction('管理接收设备…', self.configure)
+
+    def toggle_recipient(self, device_id, checked):
+        selected = list(self.prefs.get('selected_device_ids', []))
+        if checked and device_id not in selected:
+            selected.append(device_id)
+        elif not checked and device_id in selected:
+            selected.remove(device_id)
+        self.prefs['selected_device_ids'] = selected
+
+    def configure(self, discovered=None):
+        from calibre_plugins.duokan_wifi_transfer.main import DeviceManagerDialog
+        dialog = DeviceManagerDialog(self.gui, self.devices(),
+                                     self.prefs.get('active_device_id'),
+                                     self.prefs.get('selected_device_ids', []))
+        dialog.find_callback = (
+            lambda devices, manager=dialog: self.lookup(devices, origin_manager=manager))
+        if discovered:
+            dialog.merge_discovered(discovered)
+        self.current_manager = dialog
+        try:
+            if getattr(dialog, 'exec', dialog.exec_)() == QDialog.Accepted:
+                self._save_devices(*dialog.result_data())
+                self.rebuild_menu()
+        finally:
+            if self.current_manager is dialog:
+                self.current_manager = None
+
+    def send_selected(self):
+        devices = self.selected_devices()
+        if not devices:
+            self.configure()
+            if not self.devices():
+                QMessageBox.information(self.gui, '尚无接收设备',
+                                        '请手动添加设备，或使用“自动查找”。')
+            return
+        self._start_resolution(devices, True)
+
+    def _start_resolution(self, devices, send_after, origin_manager=None):
+        if self.resolution_worker is not None:
+            return
+        from calibre_plugins.duokan_wifi_transfer.main import ResolutionWorker
+        worker = ResolutionWorker(devices)
+        self.resolution_worker = worker
+        self._send_after_resolution = send_after
+        self._resolution_result = None
+        self._resolution_origin_manager = (
+            origin_manager if origin_manager is self.current_manager else None)
+        parent = self._resolution_origin_manager or self.gui
+        self.resolution_progress = QProgressDialog(
+            '正在解析接收设备…', '取消', 0, 0, parent)
+        self.resolution_progress.setWindowTitle('连接接收设备')
+        self.resolution_progress.setAutoClose(False)
+        self.resolution_progress.setWindowModality(Qt.WindowModal)
+        self.resolution_progress.canceled.connect(worker.cancel)
+        worker.resolution_progress.connect(self.resolution_progress.setLabelText)
+        worker.resolution_ready.connect(self._resolution_ready)
+        worker.finished.connect(self._resolution_stopped)
+        worker.start()
+        self.resolution_progress.show()
+
+    def _resolution_ready(self, endpoints, unresolved, changes, candidates, error):
+        if self.sender() is self.resolution_worker:
+            self._resolution_result = (endpoints, unresolved, changes, candidates, error)
+
+    def _resolution_stopped(self):
+        worker = self.sender()
+        if worker is not self.resolution_worker:
+            return
+        self.resolution_worker = None
+        if self.resolution_progress:
+            self.resolution_progress.close()
+            self.resolution_progress.deleteLater()
+            self.resolution_progress = None
+        worker.deleteLater()
+        result = self._resolution_result
+        self._resolution_result = None
+        origin_manager = self._resolution_origin_manager
+        self._resolution_origin_manager = None
+        endpoints, unresolved, changes, candidates, error = result or (
+            [], [], [], [], '解析未返回结果')
+        if self._shutting_down:
+            return
+        if error == 'cancelled':
+            return
+        origin_is_current = (
+            origin_manager is not None and origin_manager is self.current_manager)
+        if origin_manager is not None and not origin_is_current:
+            return
+        if error:
+            error_dialog(origin_manager if origin_is_current else self.gui,
+                         '设备解析失败', error, show=True)
+            if not endpoints:
+                if origin_is_current:
+                    origin_manager.merge_discovered(candidates)
+                elif origin_manager is None:
+                    self.configure(candidates)
+                return
+        if changes:
+            lines = ['%s：%s → %s（端口 %s）' % (name, old, new, port)
+                     for _did, name, old, new, port in changes]
+            info_dialog(self.gui, '发现设备地址变化',
+                        '本次将使用已验证的新地址，不会改写保存设置：\n' + '\n'.join(lines), show=True)
+        if not endpoints:
+            QMessageBox.warning(self.gui, '没有可连接的设备',
+                                '选中的接收设备均无法连接，请手动检查或添加地址。')
+            if origin_is_current:
+                origin_manager.merge_discovered(candidates)
             else:
-                self.send_action = self.menu.addAction('发送选中的书籍', self.show_dialog)
-        except:
-            # 如果获取图标失败，添加无图标的菜单项
-            self.send_action = self.menu.addAction('发送选中的书籍', self.show_dialog)
-        self.config_action = self.menu.addAction('配置WiFi地址', self.configure)
-        
-        # 从设置加载WiFi地址
-        from calibre.utils.config import JSONConfig
-        self.prefs = JSONConfig('plugins/duokan_wifi_transfer')
-        self.duokan_wifi_address = self.prefs.get('wifi_address', 'http://192.168.1.100:8080')
-    
-    def configure(self):
-        self.prefs = self.load_settings()
-        current_address = self.prefs.get('wifi_address', 'http://192.168.1.100:8080')
-        
-        new_address, ok = QInputDialog.getText(
-            self.gui, '配置多看阅读WiFi地址',
-            '输入多看阅读WiFi传书地址:',
-            QLineEdit.Normal, current_address
-        )
-        
-        if ok and new_address:
-            if not new_address.startswith('http://'):
-                new_address = 'http://' + new_address
-            
-            self.prefs['wifi_address'] = new_address
-            self.duokan_wifi_address = new_address
-            info_dialog(self.gui, '成功', '多看阅读WiFi地址已更新为: %s' % new_address, show=True)
-    
-    def load_settings(self):
-        from calibre.utils.config import JSONConfig
-        self.prefs = JSONConfig('plugins/duokan_wifi_transfer')
-        return self.prefs
-    
-    def show_dialog(self):
-        from calibre_plugins.duokan_wifi_transfer.main import DuokanWiFiDialog
-        dialog = DuokanWiFiDialog(self.gui, self)
-        exec_method = getattr(dialog, 'exec', dialog.exec_)
-        exec_method()
-    
-    def send_book_to_duokan(self, epub_path, title):
-        """发送书籍到多看阅读"""
-        try:
-            import urllib.request
-            import urllib.error
-            import mimetypes
-            import uuid
-            
-            # 打印调试信息
-            print(f"正在发送书籍: {title}")
-            print(f"目标地址: {self.duokan_wifi_address}/files")
-            print(f"文件路径: {epub_path}")
-            
-            # 生成分隔符
-            boundary = str(uuid.uuid4())
-            
-            # 构建multipart表单数据
-            content_type = mimetypes.guess_type(epub_path)[0] or 'application/epub+zip'
-            filename = os.path.basename(epub_path)
-            preamble = (
-                f'--{boundary}\r\n'
-                f'Content-Disposition: form-data; name="newfile"; filename="{filename}"\r\n'
-                f'Content-Type: {content_type}\r\n'
-                '\r\n'
-            ).encode()
-            epilogue = f'\r\n--{boundary}--\r\n'.encode()
-            file_size = os.path.getsize(epub_path)
-            content_length = len(preamble) + file_size + len(epilogue)
-
-            headers = {
-                'User-Agent': 'Calibre Duokan Plugin/1.0',
-                'Content-Type': f'multipart/form-data; boundary={boundary}',
-                'Content-Length': str(content_length)
-            }
-
-            class MultipartStream:
-                """按需读取 multipart 内容，避免一次性加载整本书。"""
-
-                def __init__(self, path, head, tail, chunk_size=64 * 1024):
-                    self.path = path
-                    self.head = head
-                    self.tail = tail
-                    self.chunk_size = chunk_size
-                    self._head_pos = 0
-                    self._tail_pos = 0
-                    self._stage = 'head'
-                    self._file = None
-
-                def read(self, size=-1):
-                    if size == 0:
-                        return b''
-
-                    chunks = bytearray()
-                    remaining = size
-
-                    while size < 0 or remaining > 0:
-                        if self._stage == 'head':
-                            data = self.head[self._head_pos:]
-                            if not data:
-                                self._stage = 'file'
-                                continue
-                            if size >= 0:
-                                data = data[:remaining]
-                            self._head_pos += len(data)
-                            chunks.extend(data)
-                        elif self._stage == 'file':
-                            if self._file is None:
-                                self._file = open(self.path, 'rb')
-                            to_read = self.chunk_size if size < 0 else min(self.chunk_size, remaining)
-                            data = self._file.read(to_read)
-                            if data:
-                                chunks.extend(data)
-                            else:
-                                self._file.close()
-                                self._file = None
-                                self._stage = 'tail'
-                                continue
-                        elif self._stage == 'tail':
-                            data = self.tail[self._tail_pos:]
-                            if not data:
-                                self._stage = 'done'
-                                break
-                            if size >= 0:
-                                data = data[:remaining]
-                            self._tail_pos += len(data)
-                            chunks.extend(data)
-                        else:
-                            break
-
-                        if size >= 0:
-                            remaining -= len(data)
-                            if remaining <= 0:
-                                break
-
-                    return bytes(chunks)
-
-                def close(self):
-                    if self._file:
-                        self._file.close()
-                        self._file = None
-
-            stream = MultipartStream(epub_path, preamble, epilogue)
-
+                self.configure(candidates)
+            return
+        if self._send_after_resolution:
+            from calibre_plugins.duokan_wifi_transfer.main import DuokanWiFiDialog
+            dialog = DuokanWiFiDialog(self.gui, endpoints, unresolved, auto_start=True)
+            self.current_send_dialog = dialog
             try:
-                request = urllib.request.Request(
-                    self.duokan_wifi_address + '/files',  # 修改为正确的URL
-                    data=stream,
-                    headers=headers,
-                    method='POST'
-                )
-                
-                # 发送请求
-                response = urllib.request.urlopen(request, timeout=30)
+                getattr(dialog, 'exec', dialog.exec_)()
             finally:
-                stream.close()
-            
-            # 打印响应信息
-            raw_content = response.read()
-            encoding = response.headers.get_content_charset() or 'utf-8'
-            try:
-                response_content = raw_content.decode(encoding)
-            except UnicodeDecodeError:
-                response_content = raw_content.decode('utf-8', errors='replace')
-            
-            print(f"响应状态码: {response.status}")
-            print(f"响应内容: {response_content}")
-            
-            if response.status == 200:
-                return True, None
+                if self.current_send_dialog is dialog:
+                    self.current_send_dialog = None
+        else:
+            discovered = candidates or endpoints
+            if origin_is_current:
+                origin_manager.merge_discovered(discovered)
+            elif discovered:
+                self.configure(discovered)
             else:
-                error_msg = f'HTTP状态码: {response.status}'
-                return False, error_msg
-                
-        except urllib.error.URLError as e:
-            reason = getattr(e, 'reason', e)
-            if isinstance(reason, ConnectionRefusedError):
-                error_msg = '无法连接到多看阅读WiFi服务（连接被拒绝）'
-            else:
-                error_msg = f'无法连接到多看阅读WiFi服务：{reason}'
-            print(f"发送书籍 {title} 发生网络错误: {error_msg}")
-            return False, error_msg
-        except Exception as e:
-            import traceback
-            error_msg = f'发送书籍 {title} 时出现未预期错误：{type(e).__name__}: {str(e)}'
-            print(f"{error_msg}\n{traceback.format_exc()}")
-            return False, error_msg
+                info_dialog(self.gui, '自动查找', '没有找到接收设备。', show=True)
+
+    def lookup(self, devices=None, origin_manager=None):
+        devices = list(devices if devices is not None else self.devices())
+        if not devices:
+            port, ok = QInputDialog.getInt(self.gui, '自动查找',
+                                           '输入多看页面显示的端口：', 8080, 1, 65535)
+            if not ok:
+                return
+            devices = [{'id': 'lookup', 'name': '待发现设备',
+                        'host': '192.168.0.1', 'port': port, 'discover': True}]
+        self._start_resolution(devices, False, origin_manager)
+
+    def shutting_down(self):
+        self._shutting_down = True
+        worker = self.resolution_worker
+        if worker:
+            worker.cancel()
+            worker.wait()
+        dialog = self.current_send_dialog
+        if dialog is not None:
+            dialog.cancel_and_wait()
+            dialog.close()
+
+    def send_book_to_duokan(self, epub_path, title, endpoint_snapshot=None):
+        target = endpoint_snapshot or (self.selected_devices() or [None])[0]
+        if target is None:
+            return False, '未配置接收设备'
+        return upload_epub(target['host'], target['port'], epub_path, title)
+
+    show_dialog = send_selected

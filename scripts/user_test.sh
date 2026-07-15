@@ -26,7 +26,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-echo "多看 WiFi 传书用户验收"
+echo "WiFi传书用户验收"
 echo "1. 手机和电脑连接同一局域网，多看阅读已开启 WiFi 传书。"
 echo "2. 在 Calibre 中准备：普通 EPUB、多本 EPUB、较大 EPUB、无 EPUB 格式书籍。"
 echo "3. 依次验证：连接成功、错误地址、单本发送、多本发送、格式缺失、手机端打开。"

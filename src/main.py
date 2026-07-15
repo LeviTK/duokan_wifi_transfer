@@ -1,371 +1,499 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function, unicode_literals
 
-from __future__ import (unicode_literals, division, absolute_import, print_function)
-
-__license__ = 'GPL v3'
-__copyright__ = '2024, LeviTK'
-__docformat__ = 'restructuredtext en'
-
-import os
-from calibre.gui2 import error_dialog, info_dialog
+import ipaddress
+import sys
+import threading
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 try:
-    from qt.core import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                        QLabel, QProgressBar, QLineEdit, QMessageBox,
-                        QThread, pyqtSignal)
+    from qt.core import (QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox,
+                         QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                         QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+                         QThread, QTimer, QVBoxLayout, Qt, pyqtSignal, QProgressBar,
+                         QHeaderView)
 except ImportError:
-    from PyQt5.Qt import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                         QLabel, QProgressBar, QLineEdit, QMessageBox,
-                         QThread, pyqtSignal)
+    from PyQt5.Qt import (QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox,
+                          QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                          QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+                          QThread, QTimer, QVBoxLayout, Qt, pyqtSignal, QProgressBar,
+                          QHeaderView)
+
+from calibre_plugins.duokan_wifi_transfer.transport import (
+    local_wifi_candidates, probe_receiver, resolve_wifi_context, saved_endpoint,
+    upload_epub)
 
 
-class ConnectionTestWorker(QThread):
-    """后台线程测试连接，避免阻塞 Calibre 主界面。"""
-    result_ready = pyqtSignal(bool, int, str, str)  # success, status_code, content, error_message
+def candidate_probe_plan(devices, context, candidates):
+    """Build saved-address-first probes using only selected devices' known ports."""
+    network = context.network
+    inside = []
+    outside = []
+    ports = []
+    for device in devices:
+        if device.get('discover'):
+            if int(device['port']) not in ports:
+                ports.append(int(device['port']))
+            continue
+        probe = (device['id'], device['host'], int(device['port']))
+        try:
+            address = ipaddress.IPv4Address(device['host'])
+            target = inside if address in network and str(address) != context.address else outside
+        except (ipaddress.AddressValueError, KeyError):
+            target = outside
+        target.append(probe)
+        if int(device['port']) not in ports:
+            ports.append(int(device['port']))
+    scans = [(host, port) for port in ports for host in candidates]
+    return inside + outside, scans
 
-    def __init__(self, address):
-        super(ConnectionTestWorker, self).__init__()
-        self.address = address
-        self.setObjectName('DuokanConnectionTest')
+
+def assign_distinct_hosts(unreachable, found_by_port, used_by_port=None):
+    """Assign only a single unambiguous host; never infer device identity by order."""
+    used_by_port = used_by_port or {}
+    assignments = {}
+    ambiguous = []
+    for port in dict.fromkeys(int(item['port']) for item in unreachable):
+        devices = [item for item in unreachable if int(item['port']) == port]
+        used = set(used_by_port.get(port, ()))
+        hosts = [host for host in dict.fromkeys(found_by_port.get(port, ()))
+                 if host not in used]
+        ordinary = [item for item in devices if not item.get('discover')]
+        if len(ordinary) == 1 and len(devices) == 1 and len(hosts) == 1:
+            assignments[devices[0]['id']] = hosts[0]
+        else:
+            ambiguous.extend((host, port) for host in hosts)
+    return assignments, ambiguous
+
+
+def merge_discovered_devices(devices, selected_ids, endpoints, id_factory=None):
+    """Pure host+port de-duplicating merge used by the manager and tests."""
+    id_factory = id_factory or (lambda: uuid.uuid4().hex)
+    merged = [dict(item) for item in devices]
+    selected = set(selected_ids)
+    known = {(item['host'].lower(), int(item['port'])): item for item in merged}
+    for endpoint in endpoints:
+        key = (endpoint['host'].lower(), int(endpoint['port']))
+        existing = known.get(key)
+        if existing is not None:
+            selected.add(existing['id'])
+            continue
+        identifier = id_factory()
+        item = {'id': identifier, 'name': endpoint.get('name') or endpoint['host'],
+                'host': endpoint['host'], 'port': int(endpoint['port'])}
+        merged.append(item)
+        known[key] = item
+        selected.add(identifier)
+    return merged, selected
+
+
+class DeviceEditDialog(QDialog):
+    def __init__(self, parent, device=None):
+        super(DeviceEditDialog, self).__init__(parent)
+        device = device or {}
+        self.setWindowTitle('编辑接收设备' if device else '添加接收设备')
+        form = QFormLayout(self)
+        self.name_edit = QLineEdit(device.get('name', ''))
+        self.host_edit = QLineEdit(device.get('host', ''))
+        self.port_edit = QSpinBox()
+        self.port_edit.setRange(1, 65535)
+        self.port_edit.setValue(int(device.get('port', 8080)))
+        form.addRow('自定义名称：', self.name_edit)
+        form.addRow('主机 / IPv4：', self.host_edit)
+        form.addRow('端口：', self.port_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def value(self, identifier):
+        host, port = saved_endpoint(self.host_edit.text(), self.port_edit.value())
+        name = self.name_edit.text().strip() or host
+        return {'id': identifier, 'name': name, 'host': host, 'port': port}
+
+
+class DeviceManagerDialog(QDialog):
+    """Single native manager; identity is always the hidden stable device ID."""
+    def __init__(self, parent, devices, active_id, selected_ids, find_callback=None):
+        super(DeviceManagerDialog, self).__init__(parent)
+        self.devices = [dict(item) for item in devices]
+        self.active_id = active_id
+        self.selected_ids = set(selected_ids)
+        self.find_callback = find_callback
+        self.setWindowTitle('管理多看接收设备')
+        self.setMinimumSize(700, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel('勾选工具栏主按钮要发送到的接收设备。名称可以重复。'))
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(('发送', '名称', '主机:端口', '默认'))
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        header = self.table.horizontalHeader()
+        resize_mode = getattr(QHeaderView, 'ResizeMode', QHeaderView)
+        header.setSectionResizeMode(1, resize_mode.Stretch)
+        header.setSectionResizeMode(2, resize_mode.Stretch)
+        layout.addWidget(self.table)
+        row = QHBoxLayout()
+        for text, slot in (('添加', self.add_device), ('编辑', self.edit_device),
+                           ('删除', self.delete_device), ('设为默认', self.set_default),
+                           ('测试 / 自动查找', self.find_device)):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.refresh()
+
+    def refresh(self):
+        self.table.setRowCount(len(self.devices))
+        for row, device in enumerate(self.devices):
+            check = QCheckBox()
+            check.setChecked(device['id'] in self.selected_ids)
+            check.toggled.connect(
+                lambda checked, did=device['id']: self.toggle_selected(did, checked))
+            self.table.setCellWidget(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(device['name']))
+            self.table.setItem(row, 2, QTableWidgetItem('%s:%s' %
+                                                       (device['host'], device['port'])))
+            self.table.setItem(row, 3, QTableWidgetItem(
+                '默认' if device['id'] == self.active_id else ''))
+        self.table.resizeColumnToContents(0)
+        self.table.resizeColumnToContents(3)
+
+    def merge_discovered(self, endpoints):
+        self.devices, self.selected_ids = merge_discovered_devices(
+            self.devices, self.selected_ids, endpoints)
+        if self.active_id is None and self.devices:
+            self.active_id = self.devices[0]['id']
+        self.refresh()
+
+    def toggle_selected(self, device_id, checked):
+        if checked:
+            self.selected_ids.add(device_id)
+        else:
+            self.selected_ids.discard(device_id)
+
+    def current_index(self):
+        row = self.table.currentRow()
+        return row if 0 <= row < len(self.devices) else None
+
+    def _edit(self, index=None):
+        import uuid
+        old = self.devices[index] if index is not None else None
+        dialog = DeviceEditDialog(self, old)
+        if getattr(dialog, 'exec', dialog.exec_)() != QDialog.Accepted:
+            return
+        identifier = old['id'] if old else uuid.uuid4().hex
+        try:
+            value = dialog.value(identifier)
+        except ValueError as err:
+            QMessageBox.warning(self, '地址无效', str(err))
+            return
+        if index is None:
+            self.devices.append(value)
+            self.selected_ids.add(identifier)
+            if self.active_id is None:
+                self.active_id = identifier
+        else:
+            self.devices[index] = value
+        self.refresh()
+
+    def add_device(self):
+        self._edit()
+
+    def edit_device(self):
+        index = self.current_index()
+        if index is not None:
+            self._edit(index)
+
+    def delete_device(self):
+        index = self.current_index()
+        if index is None:
+            return
+        identifier = self.devices[index]['id']
+        del self.devices[index]
+        self.selected_ids.discard(identifier)
+        if self.active_id == identifier:
+            self.active_id = self.devices[0]['id'] if self.devices else None
+        self.refresh()
+
+    def set_default(self):
+        index = self.current_index()
+        if index is not None:
+            self.active_id = self.devices[index]['id']
+            self.selected_ids.add(self.active_id)
+            self.refresh()
+
+    def find_device(self):
+        if self.find_callback:
+            self.find_callback(self.devices)
+
+    def result_data(self):
+        valid = {item['id'] for item in self.devices}
+        selected = [item['id'] for item in self.devices if item['id'] in self.selected_ids]
+        active = self.active_id if self.active_id in valid else (
+            self.devices[0]['id'] if self.devices else None)
+        if not selected and active:
+            selected = [active]
+        return self.devices, active, selected
+
+
+class ResolutionWorker(QThread):
+    resolution_progress = pyqtSignal(str)
+    resolution_ready = pyqtSignal(list, list, list, list, str)
+
+    def __init__(self, devices):
+        super(ResolutionWorker, self).__init__()
+        self.devices = tuple(dict(item) for item in devices)
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
 
     def run(self):
-        import urllib.request
-        import traceback
-
+        resolved = {}
+        changes = []
+        candidates_found = []
         try:
-            request = urllib.request.Request(
-                self.address,
-                headers={'User-Agent': 'Calibre Duokan Plugin/1.0'}
-            )
-            response = urllib.request.urlopen(request, timeout=5)
-            content = response.read().decode('utf-8', errors='replace')
-            print(f"测试连接响应状态码: {response.status}")
-            print(f"测试连接响应内容: {content}")
-            self.result_ready.emit(response.status == 200, response.status, content, '')
-        except Exception as e:
-            error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
-            self.result_ready.emit(False, 0, '', error_msg)
+            context = None
+            candidates = []
+            discovery_error = ''
+            if sys.platform == 'darwin':
+                context = resolve_wifi_context()
+                candidates = local_wifi_candidates(1024, context)
+            else:
+                discovery_error = '此平台不支持自动 Wi-Fi 子网查找；请手动修正无法连接的地址'
+            if context is None:
+                class AnyNetwork(object):
+                    network = ipaddress.IPv4Network('0.0.0.0/0')
+                    address = ''
+                plan_context = AnyNetwork()
+            else:
+                plan_context = context
+            saved, _scans = candidate_probe_plan(self.devices, plan_context, candidates)
+            by_id = {item['id']: item for item in self.devices}
+            unreachable = [item for item in self.devices if item.get('discover')]
+            for identifier, host, port in saved:
+                if self._cancel.is_set():
+                    break
+                device = by_id[identifier]
+                self.resolution_progress.emit('正在测试 %s（%s:%s）' %
+                                              (device['name'], host, port))
+                if probe_receiver(host, port, 1.2, context)[0]:
+                    resolved[identifier] = dict(device)
+                else:
+                    unreachable.append(device)
+            # One bounded pass per distinct known port; result is reusable by
+            # duplicate-port devices and no other port can enter this list.
+            found_by_port = {}
+            if context is not None:
+                for port in dict.fromkeys(item['port'] for item in unreachable):
+                    found_by_port[port] = self._find_port(port, candidates, context)
+            used_by_port = {}
+            for snapshot in resolved.values():
+                used_by_port.setdefault(int(snapshot['port']), set()).add(snapshot['host'])
+            assignments, ambiguous = assign_distinct_hosts(
+                unreachable, found_by_port, used_by_port)
+            candidates_found = [
+                {'id': 'discovered-%s-%s' % (host, port), 'name': '%s:%s' % (host, port),
+                 'host': host, 'port': port}
+                for host, port in ambiguous]
+            for device in unreachable:
+                host = assignments.get(device['id'])
+                if host:
+                    snapshot = dict(device)
+                    snapshot['host'] = host
+                    resolved[device['id']] = snapshot
+                    if host != device['host']:
+                        changes.append((device['id'], device['name'], device['host'], host,
+                                        device['port']))
+            unresolved = [item['name'] for item in self.devices if item['id'] not in resolved]
+            snapshots = [resolved[item['id']] for item in self.devices if item['id'] in resolved]
+            state = 'cancelled' if self._cancel.is_set() else ''
+            if not state and unresolved and discovery_error:
+                state = discovery_error
+            self.resolution_ready.emit(snapshots, unresolved, changes, candidates_found, state)
+        except Exception as err:
+            self.resolution_ready.emit([], [item['name'] for item in self.devices], [],
+                                       candidates_found, str(err))
+
+    def _find_port(self, port, candidates, context):
+        pool = ThreadPoolExecutor(max_workers=20)
+        jobs = {}
+        iterator = iter(candidates)
+        found = []
+        try:
+            while not self._cancel.is_set():
+                while len(jobs) < 40:
+                    try:
+                        host = next(iterator)
+                    except StopIteration:
+                        break
+                    jobs[pool.submit(probe_receiver, host, port, 0.7, context)] = host
+                if not jobs:
+                    return found
+                done, _ = wait(tuple(jobs), timeout=0.1, return_when=FIRST_COMPLETED)
+                for job in done:
+                    host = jobs.pop(job)
+                    if job.result()[0]:
+                        found.append(host)
+            return found
+        finally:
+            for job in jobs:
+                job.cancel()
+            pool.shutdown(wait=True)
+
+
+class LookupWorker(ResolutionWorker):
+    """Explicit lookup uses the same saved-first resolver implementation."""
 
 
 class SendBooksWorker(QThread):
-    """后台线程顺序发送书籍，减轻主线程压力。"""
-    progress = pyqtSignal(int, int, str)  # current_index, total, title
-    completed = pyqtSignal(int, list)  # success_count, failed_books
+    upload_progress = pyqtSignal(int, int, str, str)
+    upload_ready = pyqtSignal(list)
 
-    def __init__(self, plugin_action, books):
+    def __init__(self, endpoints, books):
         super(SendBooksWorker, self).__init__()
-        self.plugin_action = plugin_action
-        self.books = books
-        self.setObjectName('DuokanSendBooks')
+        self.endpoints = tuple(dict(item) for item in endpoints)
+        self.books = tuple(dict(item) for item in books)
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
 
     def run(self):
-        success_count = 0
-        failed_books = []
-        total = len(self.books)
-
-        for index, book in enumerate(self.books, start=1):
-            title = book['title']
-            epub_path = book['path']
-
-            self.progress.emit(index, total, title)
-
-            try:
-                result = self.plugin_action.send_book_to_duokan(epub_path, title)
-                if isinstance(result, tuple):
-                    success, error_message = result
+        total = len(self.endpoints) * len(self.books)
+        current = 0
+        results = []
+        for endpoint in self.endpoints:
+            if self._cancel.is_set():
+                break
+            successes = []
+            failures = []
+            for book in self.books:
+                if self._cancel.is_set():
+                    break
+                current += 1
+                self.upload_progress.emit(current, total, endpoint['name'], book['title'])
+                ok, error = upload_epub(endpoint['host'], endpoint['port'],
+                                        book['path'], book['title'],
+                                        cancel_event=self._cancel)
+                if ok:
+                    successes.append(book['title'])
                 else:
-                    success = bool(result)
-                    error_message = None if success else '发送失败'
-            except Exception as e:
-                import traceback
-                error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细追踪:\n{traceback.format_exc()}'
-                failed_books.append((title, error_msg))
-                continue
+                    failures.append((book['title'], error or '发送失败'))
+            results.append({'id': endpoint['id'], 'name': endpoint['name'],
+                            'successes': successes, 'failures': failures})
+        self.upload_ready.emit(results)
 
-            if success:
-                success_count += 1
-            else:
-                failed_books.append((title, error_message or '发送失败'))
-
-        self.completed.emit(success_count, failed_books)
 
 class DuokanWiFiDialog(QDialog):
-    def __init__(self, gui, plugin_action):
-        QDialog.__init__(self, gui)
+    def __init__(self, gui, endpoints, unresolved=None, auto_start=False):
+        super(DuokanWiFiDialog, self).__init__(gui)
         self.gui = gui
-        self.plugin_action = plugin_action
-        
-        # 设置窗口标题和大小
-        self.setWindowTitle('多看阅读WiFi传书')
-        self.setMinimumWidth(500)
-        
-        # 创建主布局
+        self.endpoints = tuple(dict(item) for item in endpoints)
+        self.unresolved = list(unresolved or [])
+        self.worker = None
+        self.shutting_down = False
+        self.setWindowTitle('发送到多看接收设备')
+        self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
-        
-        # 添加说明标签
-        layout.addWidget(QLabel('请确保：\n1. 多看阅读已开启WiFi传书\n2. 电脑和手机在同一WiFi网络下'))
-        
-        # WiFi地址设置部分
-        wifi_group = QHBoxLayout()
-        wifi_group.addWidget(QLabel('多看阅读WiFi地址:'))
-        self.wifi_address = QLineEdit(self.plugin_action.duokan_wifi_address)
-        wifi_group.addWidget(self.wifi_address)
-        self.test_button = QPushButton('测试连接')
-        self.test_button.clicked.connect(self.test_connection)
-        wifi_group.addWidget(self.test_button)
-        layout.addLayout(wifi_group)
-        
-        # 选中书籍信息
-        self.book_info = QLabel()
-        layout.addWidget(self.book_info)
-        
-        # 进度条
+        layout.addWidget(QLabel('接收设备：%s' % '、'.join(x['name'] for x in self.endpoints)))
+        self.status = QLabel('准备发送')
+        layout.addWidget(self.status)
         self.progress = QProgressBar()
-        self.progress.setVisible(False)
+        self.progress.setMinimum(0)
+        self.progress.setValue(0)
         layout.addWidget(self.progress)
-        
-        # 按钮区域
-        button_box = QHBoxLayout()
-        
-        # 发送按钮
-        self.send_button = QPushButton('发送选中的书籍')
+        self.send_button = QPushButton('发送选中的 EPUB')
         self.send_button.clicked.connect(self.send_books)
-        button_box.addWidget(self.send_button)
-        
-        # 保存设置按钮
-        save_button = QPushButton('保存设置')
-        save_button.clicked.connect(self.save_settings)
-        button_box.addWidget(save_button)
-        
-        # 关闭按钮
+        layout.addWidget(self.send_button)
         self.close_button = QPushButton('关闭')
         self.close_button.clicked.connect(self.close)
-        button_box.addWidget(self.close_button)
-        
-        layout.addLayout(button_box)
-        
-        # 更新书籍信息
-        self.update_book_info()
-        self.connection_thread = None
-        self.send_thread = None
-        self.initial_failed_books = []
-
-    def workers_running(self):
-        """Return whether a network worker is still active."""
-        return any(
-            thread is not None and thread.isRunning()
-            for thread in (self.connection_thread, self.send_thread)
-        )
-
-    def show_busy_message(self):
-        QMessageBox.information(self, '任务进行中', '后台任务尚未完成，请稍候再关闭窗口。')
+        layout.addWidget(self.close_button)
+        if auto_start:
+            QTimer.singleShot(0, self.send_books)
 
     def reject(self):
-        """Prevent Escape from destroying active QThread objects."""
-        if self.workers_running():
-            self.show_busy_message()
-            return
-        super(DuokanWiFiDialog, self).reject()
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, '任务进行中', '请等待上传完成。')
+        else:
+            super(DuokanWiFiDialog, self).reject()
 
     def closeEvent(self, event):
-        """Prevent window close while a network worker is active."""
-        if self.workers_running():
+        if self.worker and self.worker.isRunning():
             event.ignore()
-            self.show_busy_message()
-            return
-        super(DuokanWiFiDialog, self).closeEvent(event)
-    
-    def update_book_info(self):
-        """更新选中书籍的信息"""
-        rows = self.gui.library_view.selectionModel().selectedRows()
-        count = len(rows)
-        if count == 0:
-            self.book_info.setText('未选择任何书籍')
-            self.send_button.setEnabled(False)
         else:
-            self.book_info.setText(f'已选择 {count} 本书籍')
-            self.send_button.setEnabled(True)
-    
-    def test_connection(self):
-        """测试与多看阅读WiFi服务的连接"""
-        raw_address = self.wifi_address.text().strip()
-        if not raw_address:
-            return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
-        
-        address = raw_address
-        if not address.startswith('http://'):
-            address = 'http://' + address
-            self.wifi_address.setText(address)
-        
-        if self.connection_thread and self.connection_thread.isRunning():
-            return
+            super(DuokanWiFiDialog, self).closeEvent(event)
 
-        self.test_button.setEnabled(False)
+    def send_books(self):
+        if self.worker and self.worker.isRunning():
+            return
+        rows = self.gui.library_view.selectionModel().selectedRows()
+        db = self.gui.current_db.new_api
+        books = []
+        skipped = []
+        for book_id in map(self.gui.library_view.model().id, rows):
+            metadata = db.get_metadata(book_id)
+            title = metadata.title or 'ID %s' % book_id
+            path = db.format_abspath(book_id, 'EPUB')
+            if path:
+                books.append({'title': title, 'path': path})
+            else:
+                skipped.append(title)
+        if not books:
+            QMessageBox.warning(self, '没有 EPUB', '所选书籍均没有 EPUB 格式。')
+            return
+        self.skipped = skipped
         self.send_button.setEnabled(False)
         self.close_button.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress.setMaximum(0)
-        self.progress.setFormat('正在测试连接...')
-
-        self.connection_thread = ConnectionTestWorker(address)
-        self.connection_thread.result_ready.connect(self.on_connection_test_finished)
-        self.connection_thread.finished.connect(self.on_connection_thread_finished)
-        self.connection_thread.start()
-
-    def on_connection_test_finished(self, success, status_code, content, error_message):
-        """Handle completion of connection test."""
-        self.progress.setVisible(False)
-        self.progress.setMaximum(1)
+        self.worker = SendBooksWorker(self.endpoints, books)
+        self.progress.setMaximum(len(self.endpoints) * len(books))
         self.progress.setValue(0)
-        self.progress.setFormat('')
+        self.worker.upload_progress.connect(self.on_progress)
+        self.worker.upload_ready.connect(self.on_result)
+        self.worker.finished.connect(self.on_stopped)
+        self.worker.start()
 
-        if success:
-            QMessageBox.information(self, '成功', '成功连接到多看阅读WiFi服务')
-        else:
-            if error_message:
-                QMessageBox.critical(self, '错误', f'连接失败：\n{error_message}')
-            else:
-                QMessageBox.warning(
-                    self, '连接失败',
-                    f'无法连接到多看阅读WiFi服务。\n状态码: {status_code}\n响应: {content}'
-                )
-
-    def on_connection_thread_finished(self):
-        """Release the worker only after QThread has actually stopped."""
-        thread = self.connection_thread
-        self.connection_thread = None
-        if thread is not None:
-            thread.deleteLater()
-        self.test_button.setEnabled(True)
-        self.close_button.setEnabled(True)
-        self.update_book_info()
-
-    def on_send_progress(self, current, total, title):
-        """Update progress bar from background thread."""
+    def on_progress(self, current, total, device, title):
         self.progress.setMaximum(total)
         self.progress.setValue(current)
-        self.progress.setFormat(f'正在处理: {title}')
+        self.status.setText('%s / %s：%s → %s' % (current, total, title, device))
 
-    def on_send_finished(self, success_count, worker_failed_books):
-        """Handle completion of book sending."""
-        self.progress.setVisible(False)
-        self.progress.setValue(0)
-        self.progress.setFormat('')
-
-        failed_books = list(self.initial_failed_books)
-        failed_books.extend(worker_failed_books)
-        self.initial_failed_books = []
-
-        result_message = f'成功发送 {success_count} 本书籍到多看阅读\n'
-        if failed_books:
-            result_message += '\n发送失败的书籍：\n'
-            for book, reason in failed_books:
-                result_message += f'- {book}: {reason}\n'
-
-        if success_count > 0:
-            QMessageBox.information(self, '完成', result_message)
-        else:
-            QMessageBox.warning(self, '失败', result_message)
-
-    def on_send_thread_finished(self):
-        """Release the worker only after QThread has actually stopped."""
-        thread = self.send_thread
-        self.send_thread = None
-        if thread is not None:
-            thread.deleteLater()
-        self.test_button.setEnabled(True)
-        self.close_button.setEnabled(True)
-        self.update_book_info()
-
-    def save_settings(self):
-        """保存WiFi地址设置"""
-        raw_address = self.wifi_address.text().strip()
-        if not raw_address:
-            return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
-        
-        address = raw_address
-        if not address.startswith('http://'):
-            address = 'http://' + address
-            self.wifi_address.setText(address)
-        
-        self.plugin_action.duokan_wifi_address = address
-        self.plugin_action.prefs['wifi_address'] = address
-        QMessageBox.information(self, '成功', '设置已保存')
-    
-    def send_books(self):
-        """发送选中的书籍到多看阅读"""
-        if self.send_thread and self.send_thread.isRunning():
-            return QMessageBox.information(self, '提示', '正在发送书籍，请稍候')
-
-        # 确保目标地址有效
-        raw_address = self.wifi_address.text().strip()
-        if not raw_address:
-            return error_dialog(self, '错误', '请输入多看阅读WiFi地址', show=True)
-
-        current_address = raw_address
-        if not current_address.startswith('http://'):
-            current_address = 'http://' + current_address
-            self.wifi_address.setText(current_address)
-
-        self.plugin_action.duokan_wifi_address = current_address
-
-        # 获取选中的书籍
-        rows = self.gui.library_view.selectionModel().selectedRows()
-        if not rows:
-            return error_dialog(self, '错误', '请先选择要发送的书籍', show=True)
-        
-        # 获取书籍IDs
-        ids = list(map(self.gui.library_view.model().id, rows))
-        db = self.gui.current_db.new_api
-
-        books_to_send = []
-        self.initial_failed_books = []
-
-        for book_id in ids:
-            metadata = None
-            title = f'ID {book_id}'
-            try:
-                metadata = db.get_metadata(book_id)
-                if metadata:
-                    title = metadata.title or title
-            except Exception as e:
-                import traceback
-                error_msg = f'错误类型: {type(e).__name__}\n错误信息: {str(e)}'
-                self.initial_failed_books.append((title, error_msg))
-                print(f"准备书籍 {title} 时出错:\n{traceback.format_exc()}")
-                continue
-
-            epub_path = db.format_abspath(book_id, 'EPUB')
-            if not epub_path:
-                self.initial_failed_books.append((title, "没有EPUB格式"))
-                continue
-
-            books_to_send.append({'title': title, 'path': epub_path})
-
-        if not books_to_send:
-            result_message = '没有可发送的书籍。\n'
-            if self.initial_failed_books:
-                result_message += '\n发送失败的书籍：\n'
-                for book, reason in self.initial_failed_books:
-                    result_message += f'- {book}: {reason}\n'
-            QMessageBox.warning(self, '失败', result_message)
+    def on_result(self, results):
+        if self.shutting_down:
             return
+        lines = []
+        for result in results:
+            lines.append('%s：成功 %s，失败 %s' %
+                         (result['name'], len(result['successes']), len(result['failures'])))
+            lines.extend('  %s：%s' % item for item in result['failures'])
+        if self.unresolved:
+            lines.extend('%s：未连接，已跳过全部所选书籍' % name
+                         for name in self.unresolved)
+        if self.skipped:
+            for endpoint in self.endpoints:
+                lines.append('%s：无 EPUB，已跳过 %s' %
+                             (endpoint['name'], '、'.join(self.skipped)))
+        QMessageBox.information(self, '发送结果', '\n'.join(lines))
 
-        # 准备进度条和按钮
-        total = len(books_to_send)
-        self.progress.setMaximum(total)
-        self.progress.setValue(0)
-        self.progress.setFormat('准备发送...')
-        self.progress.setVisible(True)
+    def on_stopped(self):
+        worker = self.worker
+        self.worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.send_button.setEnabled(True)
+        self.close_button.setEnabled(True)
 
-        self.send_button.setEnabled(False)
-        self.test_button.setEnabled(False)
-        self.close_button.setEnabled(False)
-
-        # 启动后台线程
-        self.send_thread = SendBooksWorker(self.plugin_action, books_to_send)
-        self.send_thread.progress.connect(self.on_send_progress)
-        self.send_thread.completed.connect(self.on_send_finished)
-        self.send_thread.finished.connect(self.on_send_thread_finished)
-        self.send_thread.start()
+    def cancel_and_wait(self):
+        self.shutting_down = True
+        worker = self.worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait()

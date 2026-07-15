@@ -16,12 +16,12 @@ class DuokanWifiBase(InterfaceActionBase):
     and is defined in the ui.py file, as specified in the actual_plugin field
     below.
     '''
-    name                = '多看阅读WiFi传书'
+    name                = 'WiFi传书'
     description         = '通过WiFi将书籍传输到多看阅读'
     supported_platforms = ['windows', 'osx', 'linux']
     author             = 'LeviTK'
-    version            = (1, 2, 1)
-    minimum_calibre_version = (2, 0, 0)
+    version            = (1, 3, 0)
+    minimum_calibre_version = (5, 0, 0)
 
     #: This field defines the GUI plugin class that contains all the code
     #: that actually does something. Its specified as a string to avoid

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Calibre WiFi传书插件图标</title>
+  <g fill="none" stroke="#F58220" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M250 575c95-78 188-94 262-40v315c-79-54-166-48-262 15z"
+          fill="#FFFFFF" stroke-width="48"/>
+    <path d="M774 575c-95-78-188-94-262-40v315c79-54 166-48 262 15z"
+          fill="#FFFFFF" stroke-width="48"/>
+    <path d="M377 455c75-70 195-70 270 0" stroke-width="48"/>
+    <path d="M426 392c47-43 125-43 172 0" stroke-width="42"/>
+    <path d="M480 332c18-17 46-17 64 0" stroke-width="38"/>
+  </g>
+  <g fill="#F58220">
+    <rect x="694" y="105" width="190" height="330" rx="42"/>
+    <rect x="735" y="162" width="108" height="192" rx="8" fill="#FFFFFF"/>
+    <circle cx="789" cy="394" r="17" fill="#FFFFFF"/>
+    <path d="M435 210h175v-55l118 91-118 91v-55H435z"/>
+  </g>
+</svg>

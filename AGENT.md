@@ -24,10 +24,10 @@ AGENT.md
 ## 架构说明
 
 - **`InterfacePlugin`**（ui.py）：Calibre 工具栏入口，管理配置持久化（JSONConfig），调用 `send_book_to_duokan()` 执行 HTTP 上传。
-- **`DuokanWiFiDialog`**（main.py）：主对话框，展示选书信息、进度条，协调两个后台线程。
-- **`ConnectionTestWorker`**（main.py）：QThread，异步 GET 测试目标地址是否可达。
-- **`SendBooksWorker`**（main.py）：QThread，顺序遍历书单，逐本调用 `send_book_to_duokan()`，通过 `progress` / `finished` 信号汇报状态。
-- **`MultipartStream`**（ui.py）：自定义流式读取器，分块拼接 multipart 请求体，避免大文件整体加载进内存。
+- **`DeviceManagerDialog`**（main.py）：原生多设备管理器，按稳定 ID 管理默认设备和多选收件人。
+- **`ResolutionWorker`**（main.py）：发送前验证保存地址，并仅按已知端口在当前 Wi-Fi 子网解析不可达设备。
+- **`SendBooksWorker`**（main.py）：持有不可变设备/书籍快照，执行书籍 × 接收设备上传并按设备汇报结果。
+- **`transport.py`**：代理无关的直连探测、Wi-Fi 绑定和分块 multipart 上传。
 
 ## 开发约定
 
@@ -61,6 +61,7 @@ make user-test          # 以调试模式启动 Calibre，保存日志并进入�
 
 - `make verify` 必须使用临时 `CALIBRE_CONFIG_DIRECTORY`，不得修改用户日常配置。
 - 发布 ZIP 必须经过 `calibre-customize -a` 全新安装测试，开发源码必须经过 `calibre-customize -b src` 测试。
+- 日常 Calibre 安装必须使用刚通过验证的版本化 ZIP，不直接安装可能包含缓存文件的源码目录。
 - 模拟上传测试在 `127.0.0.1` 随机端口启动临时 HTTP 服务，不访问外网或手机。
 - 真实安装前必须备份已安装插件；默认不强制关闭 Calibre。
 - 手机端实际收书和打开 EPUB 仍是人工验收项，步骤见 `doc/USER_TESTING.md`。
